@@ -8,7 +8,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "langgraphjs dev",
+    "dev": "langgraphjs dev --no-browser",
     "build": "tsc",
     "clean": "rm -rf dist",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --testPathPatterns=\\.test\\.ts$ --testPathIgnorePatterns=\\.int\\.test\\.ts$",
