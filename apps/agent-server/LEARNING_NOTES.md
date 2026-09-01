@@ -68,16 +68,16 @@ export const State = new StateSchema({
 `src/agent/index.ts` 的核心逻辑如下：
 
 ```ts
-const answerMessage = async state => {
+const handleMessageTask = async state => {
   const model = createChatModel()
   const result = await model.invoke(state.messages)
   return { messages: [result] }
 }
 
 const builder = new StateGraph(State)
-  .addNode('answerMessage', answerMessage)
-  .addEdge(START, 'answerMessage')
-  .addEdge('answerMessage', END)
+  .addNode('handleMessageTask', handleMessageTask)
+  .addEdge(START, 'handleMessageTask')
+  .addEdge('handleMessageTask', END)
 
 export const graph = builder.compile()
 graph.name = 'ScreenDesignAgent'
@@ -89,7 +89,7 @@ graph.name = 'ScreenDesignAgent'
 输入消息
    │
    ▼
-START ──► answerMessage ──► END
+START ──► handleMessageTask ──► END
              │
              ├─ 创建聊天模型
              ├─ 用完整消息历史调用模型
