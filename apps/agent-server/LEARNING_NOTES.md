@@ -1,10 +1,10 @@
 # LangGraph.js Agent Server 学习笔记
 
-> 本笔记根据当前 `apps/agent-server` 的实现整理，目标是理解一个最小可运行的 LangGraph.js 对话 Agent 如何定义状态、调用模型、编译图并交给 LangGraph Server 运行。
+> 本笔记按项目演进过程持续整理。第 1～10 节记录最小单节点 Agent 阶段，第 11 节开始记录意图分类、条件路由和编辑器上下文接入。
 
 ## 1. 项目定位
 
-这是一个基于 **LangGraph.js** 的最小对话 Agent 服务。当前实现只有一个处理节点：接收消息历史，调用 OpenAI 兼容的聊天模型，并把模型返回的消息追加回状态。
+这是一个基于 **LangGraph.js** 的 AI 大屏设计 Agent 服务。项目最初只有一个对话节点，当前已经演进为“意图分类 + 分类任务处理”的多分支流程。
 
 项目入口由 `langgraph.json` 声明：
 
@@ -105,7 +105,7 @@ START ──► handleMessageTask ──► END
 - `compile()`：将构建器编译成可执行图。
 - `graph.name`：为图设置便于调试和识别的名称。
 
-当前图是线性流程，适合入门。更复杂的 Agent 通常会增加条件边，例如“模型要求调用工具”时转向工具节点，否则直接结束。
+以上是项目第一阶段的线性流程。当前实现已经增加条件边，详细内容见第 11 节。
 
 ## 5. 模型配置：OpenAI Responses API
 
@@ -179,7 +179,7 @@ pnpm test:int              # 集成测试
 
 ## 8. 当前实现的边界
 
-当前项目是“单节点聊天”示例，并未实现以下能力：
+在第一阶段，项目还是“单节点聊天”示例，并未实现以下能力：
 
 - 工具调用和外部系统操作。
 - 条件路由或多轮 Agent 循环。
@@ -214,4 +214,247 @@ pnpm test:int              # 集成测试
 
 ## 10. 一句话总结
 
-这个项目展示了 LangGraph.js 的最小闭环：**用 `StateSchema` 定义消息状态，用节点函数执行业务逻辑，用边描述流程，最后编译成可被 LangGraph Server 加载的图**。
+第一阶段展示了 LangGraph.js 的最小闭环：**用 `StateSchema` 定义消息状态，用节点函数执行业务逻辑，用边描述流程，最后编译成可被 LangGraph Server 加载的图**。
+
+---
+
+## 11. 第二阶段：从单节点升级为意图路由
+
+当前图不再直接回答所有请求，而是先判断用户意图，再把任务交给对应节点：
+
+```text
+                         ┌─ message ─► handleMessageTask ─┐
+输入 ─► START ─► classifyTask ├─ edit ───► handleEditTask ───┼─► END
+                         └─ page ───► handlePageTask ────┘
+```
+
+三种任务的含义如下：
+
+| 分类      | 含义                   | 当前处理方式                   |
+| --------- | ---------------------- | ------------------------------ |
+| `message` | 普通问答、查询页面事实 | 调用模型并提供完整编辑器上下文 |
+| `edit`    | 修改当前页面           | 暂时返回固定的任务确认消息     |
+| `page`    | 创建完整页面或大屏     | 暂时返回固定的任务确认消息     |
+
+这是一种典型的“路由器 + 专用节点”设计。分类节点只负责判断任务类型，具体任务由下游节点完成，各节点的职责比把所有提示词和逻辑堆在一个节点中更清晰。
+
+## 12. 使用 Zod 定义分类结果
+
+`src/agent/classification.ts` 使用 Zod 限制模型输出：
+
+```ts
+export const ClassificationSchema = z.object({
+  task: z
+    .enum(['message', 'page', 'edit'])
+    .describe(
+      '识别用户意图的任务分类，message = 普通问答，page = 创建页面，edit = 修改页面'
+    ),
+})
+```
+
+这里的重点是：不要依赖模型自由生成一段文本后再手动解析，而是直接要求模型返回符合 Schema 的结构化数据。
+
+```ts
+const model = chatModel.withStructuredOutput(ClassificationSchema, {
+  name: 'task_classification',
+  method: 'jsonSchema',
+})
+```
+
+`withStructuredOutput` 的作用包括：
+
+- 将期望的字段和枚举值告诉模型。
+- 将模型响应解析为 JavaScript 对象。
+- 根据 Zod Schema 校验结果，减少非法分类进入路由器的概率。
+- 让 `response.task` 的业务含义比解析自然语言更稳定。
+
+## 13. 分类节点的完整过程
+
+`classifyTask` 的处理过程可以拆成五步：
+
+1. 创建专用于分类的模型实例。
+2. 使用 `withStructuredOutput` 约束响应格式。
+3. 从消息历史中找到最后一条用户消息。
+4. 结合系统分类规则调用模型。
+5. 将分类写入图状态的 `classification` 字段。
+
+```ts
+return {
+  classification: {
+    task,
+  },
+}
+```
+
+分类调用使用了两个额外配置：
+
+```ts
+const chatModel = createChatModel({
+  disableStreaming: true,
+})
+
+await model.invoke(messages, {
+  tags: ['nostream'],
+})
+```
+
+- `disableStreaming: true`：分类结果是内部控制信息，不需要像最终回答一样逐字输出。
+- `tags: ['nostream']`：给本次运行附加追踪标签，便于在支持标签的日志或追踪系统中识别这类调用。标签本身不会自动关闭流式输出，真正控制行为的是模型配置。
+
+## 14. 获取最后一条用户消息
+
+工具函数 `getLastUserMessage` 使用 `findLast` 从后向前寻找人类消息：
+
+```ts
+export function getLastUserMessage(messages: BaseMessage[]) {
+  return messages.findLast(message => message.type === 'human')
+}
+```
+
+不能简单使用 `messages.at(-1)`，因为消息历史的最后一项可能是 AI 消息或工具消息。按 `type === 'human'` 查找才能得到最近一次真正的用户输入。
+
+项目同时把 TypeScript 的 `lib` 调整为 `ESNext`，以便类型系统识别 `Array.prototype.findLast`。部署时仍要确保实际 Node.js 版本支持该 API；当前 `langgraph.json` 指定 Node.js 20，可以满足要求。
+
+### 边界情况
+
+当消息列表中没有用户消息时，`findLast` 会返回 `undefined`。当前分类节点会把该值传给模型，因此后续应在入口校验或工具函数中明确处理“缺少用户消息”的情况。
+
+## 15. 扩展后的图状态
+
+状态不再只有 `messages`，还包含编辑器运行所需的数据：
+
+```ts
+export const State = new StateSchema({
+  messages: MessagesValue,
+  page: z.record(z.string(), z.json()),
+  selectedNodeIds: z.array(z.string()),
+  schema: z.object({
+    material: z.array(z.record(z.string(), z.json())),
+    canvas: z.record(z.string(), z.json()),
+  }),
+  classification: ClassificationSchema,
+})
+```
+
+| 状态字段          | 用途                                             |
+| ----------------- | ------------------------------------------------ |
+| `messages`        | 保存用户、模型等对话消息                         |
+| `page`            | 保存当前页面数据，目前会读取 `nodes` 和 `canvas` |
+| `selectedNodeIds` | 保存用户当前选中的节点 ID                        |
+| `schema.material` | 描述可用物料及其属性结构                         |
+| `schema.canvas`   | 描述画布支持的配置结构                           |
+| `classification`  | 保存分类节点输出的任务类型                       |
+
+`z.record(z.string(), z.json())` 适合接收键名动态、值为 JSON 的对象。它比完全不校验的任意对象更安全，但约束仍然比较宽松。等页面协议稳定后，可以把 `page`、`material` 和 `canvas` 逐步替换为更具体的 Schema。
+
+## 16. 条件边如何完成任务分发
+
+图通过 `addConditionalEdges` 读取分类结果：
+
+```ts
+.addConditionalEdges(
+  'classifyTask',
+  state => state.classification.task,
+  {
+    message: 'handleMessageTask',
+    edit: 'handleEditTask',
+    page: 'handlePageTask',
+  }
+)
+```
+
+它包含三个组成部分：
+
+1. `'classifyTask'`：条件判断发生在哪个节点之后。
+2. 路由函数：从状态中取出 `message`、`edit` 或 `page`。
+3. 映射表：把路由值映射到真正执行的节点名。
+
+由于分类结果已经受枚举 Schema 限制，映射表可以覆盖所有合法分支。三个任务节点执行后都通过固定边进入 `END`，因此当前每次图运行只处理一种任务，不会在任务节点之间循环。
+
+## 17. 普通问答节点如何注入编辑器上下文
+
+`handleMessageTask` 不再只把原始消息列表交给模型，而是重新组装最后一条用户消息：
+
+```text
+系统角色提示
+  + 之前的对话历史
+  + 最后一个用户问题
+  + 当前页面 nodes / canvas
+  + 当前选中的节点 selectedNodeIds
+  + canvas Schema
+  + material Schema
+```
+
+代码先复制消息列表并取出最后一项：
+
+```ts
+const _messages = [...messages]
+const lastMessage = _messages.pop()
+```
+
+然后把最后一条消息的文本与编辑器状态组合成新的 `HumanMessage`。这样做的目的，是让模型不仅理解用户的问题，还能根据当前页面的真实数据回答，例如“选中的组件是什么”“页面上有多少节点”等。
+
+使用 `JSON.stringify(value, null, 2)` 能让对象以缩进后的 JSON 出现在提示词中，便于模型识别层级。不过页面和物料数据增大后，会明显增加 Token 消耗，后续可考虑：
+
+- 只传与用户问题相关的节点和 Schema。
+- 对大对象裁剪无关字段。
+- 为上下文设置体积或 Token 上限。
+- 对敏感字段进行过滤。
+
+### 当前假设
+
+该节点假设消息列表最后一项就是本轮用户消息，并直接读取 `lastMessage.text`。如果图可能从其他节点恢复、末尾出现工具消息，或输入消息为空，就需要改为复用 `getLastUserMessage` 并增加空值处理。
+
+## 18. 模型工厂支持调用级参数
+
+`createChatModel` 现在允许调用者传入 `ChatOpenAI` 构造参数：
+
+```ts
+export function createChatModel(
+  options?: ConstructorParameters<typeof ChatOpenAI>[0]
+) {
+  return new ChatOpenAI({
+    model: process.env.OPENAI_CHAT_MODEL,
+    modelKwargs: { store: false },
+    ...options,
+  })
+}
+```
+
+`ConstructorParameters<typeof ChatOpenAI>[0]` 直接复用了 SDK 构造函数的参数类型，不需要在项目里重复维护一份配置接口。
+
+展开运算符 `...options` 放在默认值之后，因此调用方可以覆盖默认配置。例如分类节点可以设置 `disableStreaming: true`。需要注意，如果调用方传入新的 `modelKwargs`，会整体替换默认的 `{ store: false }`，而不是进行深层合并。
+
+另外，当前代码已经注释掉 `useResponsesApi: true`，所以前文第 5 节描述的是第一阶段配置；是否启用 Responses API 现在取决于 SDK 默认行为及后续显式配置。
+
+## 19. 页面生成与编辑节点仍是占位实现
+
+`handleEditTask` 和 `handlePageTask` 当前只返回固定的 `AIMessage`：
+
+```ts
+return {
+  messages: [new AIMessage('接到任务：根据用户的意图，修改大屏的字典。')],
+}
+```
+
+它们已经验证了条件路由能够到达正确分支，但尚未真正生成或修改页面数据。后续实现时，应让节点返回明确的数据变更，而不只是自然语言说明。
+
+一种可继续演进的职责划分是：
+
+- `handlePageTask`：根据用户描述和物料 Schema 生成完整页面结构。
+- `handleEditTask`：根据用户意图、当前页面和选中节点生成局部修改。
+- 结构校验节点：使用 Zod 验证模型产生的页面或补丁。
+- 应用节点：将验证后的结果写回 `page` 状态。
+
+## 20. 第二阶段总结
+
+这一阶段完成了 Agent 从“统一回答”到“先理解任务，再分派处理”的升级：
+
+1. Zod Schema 约束分类结果。
+2. 结构化输出提高路由稳定性。
+3. 条件边将三类意图送入专用节点。
+4. 状态加入页面、选中节点和编辑器 Schema。
+5. 普通问答节点开始依据编辑器真实上下文回答。
+6. 模型工厂支持不同节点覆盖调用配置。
+
+当前最值得继续的方向，是实现 `page` 和 `edit` 分支的结构化输出、状态更新与校验闭环。
