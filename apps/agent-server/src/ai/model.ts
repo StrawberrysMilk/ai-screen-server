@@ -15,3 +15,13 @@ export function createChatModel(
     ...options,
   })
 }
+
+export function createNoStreamingModel(
+  options?: Parameters<typeof createChatModel>[0] // 获取 createChatModel 函数的参数类型
+) {
+  return createChatModel({
+    ...options,
+    disableStreaming: true, // 禁用流式输出
+    tags: ['nostream'], // 添加标签，方便区分
+  })
+}
