@@ -1,9 +1,19 @@
 // 修改大屏字典
 import { HumanMessage } from '@langchain/core/messages'
 import { createNonStreamingModel, createChatModel } from '@/ai/model.js'
-import { ADD_NODE, REMOVE_NODE, UPDATE_NODE } from './planEdit.js'
+import {
+  ADD_DATA_SOURCE,
+  ADD_NODE,
+  REMOVE_NODE,
+  UPDATE_DATA_SOURCE,
+  UPDATE_NODE,
+} from './planEdit.js'
 import { searchEChartsOptions } from '@/rag/tools.ts'
 import { createAgent, toolStrategy } from 'langchain'
+import {
+  generateDataSource,
+  updateDataSource,
+} from '@/agent/task-nodes/dataSources.ts'
 
 async function generateNode(materialSchema, prompt) {
   const agent = createAgent({
@@ -79,6 +89,33 @@ export async function handleEditTask(state) {
   for (const plan of plans) {
     const { type, id, action, prompt } = plan
     const schema = state.schema.material.find(m => m.type === type)
+    if (action === ADD_DATA_SOURCE) {
+      // 处理新增数据源的逻辑
+      const dataSource = await generateDataSource(
+        prompt,
+        state.schema.dataSource
+      )
+
+      actions.push({
+        node: dataSource,
+        type: ADD_DATA_SOURCE,
+      })
+    }
+    if (action === UPDATE_DATA_SOURCE) {
+      // 处理更新数据源的逻辑
+      const currentDataSource = state.dataSources.find(ds => ds.id === id)
+      if (currentDataSource) {
+        const dataSource = await updateDataSource(
+          prompt,
+          currentDataSource,
+          state.schema.dataSource
+        )
+        actions.push({
+          node: dataSource,
+          type: UPDATE_DATA_SOURCE,
+        })
+      }
+    }
     if (action === ADD_NODE) {
       // 处理新增节点的逻辑
       const node = await generateNode(schema, prompt)
