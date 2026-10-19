@@ -1,4 +1,4 @@
-import { createChatModel, createNoStreamingModel } from '@/ai/model.js'
+import { createChatModel, createNonStreamingModel } from '@/ai/model.js'
 import { SystemMessage, HumanMessage } from '@langchain/core/messages'
 import { z } from 'zod'
 
@@ -33,7 +33,7 @@ export async function handlePlanEdit(state) {
     }
   })
   const nodes = state.page.nodes
-  const model = createNoStreamingModel().withStructuredOutput(
+  const model = createNonStreamingModel().withStructuredOutput(
     z.object({
       editPlan: z.array(
         PlanEditSchema.extend({

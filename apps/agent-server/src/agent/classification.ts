@@ -1,7 +1,7 @@
 // 当前做意图识别
 import { z } from 'zod'
 import { SystemMessage } from '@langchain/core/messages'
-import { createNoStreamingModel } from '../ai/model.js'
+import { createNonStreamingModel } from '../ai/model.js'
 
 export const ClassificationSchema = z.object({
   task: z
@@ -12,7 +12,7 @@ export const ClassificationSchema = z.object({
 })
 
 export async function classifyTask(state) {
-  const chatModel = createNoStreamingModel()
+  const chatModel = createNonStreamingModel()
 
   const model = chatModel.withStructuredOutput(ClassificationSchema, {
     name: 'task_classification',

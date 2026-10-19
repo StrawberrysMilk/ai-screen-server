@@ -458,3 +458,370 @@ return {
 6. 模型工厂支持不同节点覆盖调用配置。
 
 当前最值得继续的方向，是实现 `page` 和 `edit` 分支的结构化输出、状态更新与校验闭环。
+
+---
+
+## 21. 第三阶段：编辑请求的计划与执行
+
+编辑分支已经从固定回复升级为两步处理：先把用户需求拆成 `editPlan`，再逐项执行计划并收集 `actions`。
+
+```text
+classifyTask(task = edit)
+        │
+        ▼
+handlePlanEdit
+        │
+        ├─ editPlan 为空 ─────────► END（返回补充信息）
+        │
+        └─ editPlan 有内容
+                │
+                ▼
+          handleEditTask
+                │
+                ▼
+          handleEditResult
+                │
+                ▼
+               END
+```
+
+当前完整图的关键边定义如下：
+
+```ts
+.addConditionalEdges('classifyTask', state => state.classification.task, {
+  message: 'handleMessageTask',
+  page: 'handlePageTask',
+  edit: 'handlePlanEdit',
+})
+.addConditionalEdges('handlePlanEdit', state => {
+  return state.editPlan.length > 0 ? 'handleEditTask' : END
+})
+.addEdge('handleEditTask', 'handleEditResult')
+.addEdge('handleEditResult', END)
+```
+
+这种拆分把“理解用户要做什么”和“真正操作节点”分开。计划节点可以一次产生多个操作，执行节点则只处理已经明确的单节点任务。
+
+## 22. 编辑计划的数据结构
+
+`planEdit.ts` 定义了三个操作类型：
+
+```ts
+export const ADD_NODE = 'add_node'
+export const UPDATE_NODE = 'update_node'
+export const REMOVE_NODE = 'remove_node'
+```
+
+每个计划项包含四个字段：
+
+| 字段     | 含义                              |
+| -------- | --------------------------------- |
+| `action` | 新增、更新或删除                  |
+| `id`     | 目标节点 ID；新增时为 `null`      |
+| `type`   | 物料类型，必须来自当前可用物料    |
+| `prompt` | 传给节点生成/修改模型的独立提示词 |
+
+计划模型还会返回一个可空的 `message`：
+
+- 可以执行时，`editPlan` 有内容，`message` 为 `null`。
+- 信息不足或目标不明确时，`editPlan` 为空，`message` 描述需要补充的信息。
+
+`handlePlanEdit` 会把当前物料压缩为 `{ type, name }` 列表，把当前节点、选中节点 ID 和画布尺寸放入系统提示词，让模型根据编辑器真实状态规划操作顺序。
+
+### 为什么每项只处理一个节点
+
+每项 `prompt` 必须能单独说明一个节点的内容、样式和布局。这样执行阶段可以逐项调用模型，某个节点失败时更容易定位，也能让新增、更新和删除保持清晰的动作边界。
+
+## 23. 计划为空时的反馈路径
+
+当模型返回空计划或带有 `message` 时，`handlePlanEdit` 不进入执行节点，而是再次调用聊天模型，把缺失信息改写成给用户看的自然语言：
+
+```ts
+if (!result.editPlan.length || result.message) {
+  const message = await chatModel.invoke([
+    new SystemMessage('你是大屏的信息反馈助手...'),
+    new HumanMessage(result.message),
+  ])
+
+  return {
+    messages: [message],
+    editPlan: [],
+    actions: [],
+  }
+}
+```
+
+这条路径的好处是把内部的规划结果与用户交互隔离：用户只看到需要补充什么，不会看到 `editPlan`、Schema 或内部字段。
+
+当前实现依赖 `result.message` 在该分支中有内容。生产实现应为它设置兜底文本，并对模型返回的结构做更严格的空值校验。
+
+## 24. 三类节点动作的执行方式
+
+`handleEditTask` 遍历计划并把动作写入 `actions`：
+
+### 新增节点
+
+`add_node` 会根据物料类型找到物料 Schema，再调用 `generateNode`。生成结果会补充服务端负责的字段：
+
+```ts
+return {
+  ...node,
+  id: crypto.randomUUID(),
+  type: materialSchema.type,
+}
+```
+
+模型只负责生成符合物料配置的内容，节点 ID 和类型由代码写入，避免模型自行生成不稳定的标识。
+
+### 更新节点
+
+`update_node` 根据计划中的 `id` 从 `state.page.nodes` 找到当前节点，然后把原节点 JSON 放入提示词。模型只返回可编辑配置，代码再次强制保留原节点的 `id` 和 `type`：
+
+```ts
+return {
+  ...node,
+  id: currentNode.id,
+  type: currentNode.type,
+}
+```
+
+提示词明确允许修改 `props`、`layout`、`style` 等属性，并禁止修改基础标识。这是“模型提议变更，代码守住身份字段”的典型边界。
+
+### 删除节点
+
+`remove_node` 不需要再次调用模型，直接把当前节点放入动作列表，前端或后续应用层根据动作类型删除它。
+
+## 25. 动作结果与最终回复
+
+`handleEditTask` 返回：
+
+```ts
+return {
+  actions,
+}
+```
+
+它暂时没有直接写回 `page`，而是把结构化动作交给 `handleEditResult`。后者调用模型生成面向用户的最终反馈，并要求模型：
+
+- 只描述动作中真实存在的结果。
+- 不展示 JSON、Schema、代码或内部执行过程。
+- 说明新增或修改了哪些节点及主要变化。
+
+完成回复后，节点返回 `actions: []`，避免动作结果在后续状态读取中重复使用。真正把动作应用到画布数据的职责目前仍在图外，通常由前端 reducer、服务端应用节点或持久化层完成。
+
+## 26. ECharts RAG 知识库的素材
+
+`resources/echarts/` 下的 JSON 文件来自 ECharts option 配置说明。当前素材覆盖：
+
+- `dataset`
+- `grid`
+- `legend`
+- `series.bar`
+- `series.line`
+- `series.pie`
+- `title`
+- `tooltip`
+- `xAxis`
+- `yAxis`
+
+每个文件是一个配置对象，属性通常包含 `desc` 字段，字段名可能是相对路径，例如 `barWidth`、`source` 或 `textStyle.color`。构建脚本会为它们补上文件级前缀，形成可检索的完整路径，例如：
+
+```text
+option.series-bar.json + barWidth
+        ↓
+series.bar.barWidth
+```
+
+路径参与检索文本后，模型查询“柱状图柱宽”时更容易命中正确的系列配置，而不是只匹配到含义相似的通用字段。
+
+## 27. 从文档到向量的构建流程
+
+`src/scripts/build-echarts-rag.ts` 是离线知识库构建脚本，流程如下：
+
+1. 读取 `resources/echarts/` 中的所有 JSON 文件。
+2. 将每个配置对象展开成 `{ id, path, description }` 知识片段。
+3. 用 `cleanDescription` 清理 HTML 标签、脚本、样式、列表和连续空白。
+4. 拼接 `ECharts 配置 ${path}\n${description}` 作为向量化文本。
+5. 每批最多处理 10 条文本，调用 Embedding 模型生成向量。
+6. 将知识片段和向量写入 `data/rag.sqlite`。
+
+`cleanDescription` 先删除 `<script>`、`<style>` 和 `<iframe>` 内容，再把段落、列表和代码块结束转换成换行，最后去掉剩余标签。这样可以保留文档的基本层级，同时避免把网页 HTML 直接送给 Embedding 模型。
+
+批大小为 10 是当前 Embedding 服务的请求限制；`createEmbeddingModel` 也设置了 `batchSize: 10`、`maxConcurrency: 1` 和 `maxRetries: 0`，以降低请求过大、并发过高和失败重试导致的不可控行为。
+
+## 28. SQLite 与 sqlite-vec 的向量检索
+
+`src/rag/database.ts` 使用两个表保存知识库：
+
+```sql
+CREATE TABLE chunks (
+  rowid INTEGER PRIMARY KEY,
+  chunk_id TEXT NOT NULL UNIQUE,
+  path TEXT NOT NULL,
+  description TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE chunk_vectors USING vec0(
+  embedding float[维度] distance_metric=cosine
+);
+```
+
+普通表保存可读的文档信息，`vec0` 虚拟表保存向量。写入时先插入 `chunks`，取得 SQLite 的 `rowid`，再使用同一个 `rowid` 插入向量。两个表因此可以通过 `rowid` 关联。
+
+向量维度从第一条向量动态读取：
+
+```ts
+const dimensions = vectors[0].length
+```
+
+这要求构建批次非空，并要求同一知识库中的所有向量维度一致。写入和查询都调用 `sqliteVec.load(db)`，因为每个 SQLite 连接都需要加载扩展后才能使用 `vec0`。
+
+查询使用余弦距离：
+
+```sql
+WHERE v.embedding MATCH ? AND k = ?
+ORDER BY v.distance
+```
+
+`searchKnowledgeDatabase` 以只读方式打开数据库，返回最接近的 `topK` 条记录。当前实现保留了 `distance` 字段供数据库层排序，但上层工具会把它过滤掉。
+
+## 29. ECharts 检索工具如何被 Agent 调用
+
+`searchEChartsOptions` 使用 LangChain `tool` 声明一个可调用工具：
+
+```ts
+export const searchEChartsOptions = tool(
+  async ({ query }) => {
+    const vector = await createEmbeddingModel().embedQuery(query)
+    const chunks = searchKnowledgeDatabase(vector, 3)
+    return JSON.stringify(
+      chunks.map(chunk => ({
+        path: chunk.path,
+        description: chunk.description,
+      }))
+    )
+  },
+  {
+    name: 'search_echarts_options',
+    schema: z.object({ query: z.string() }),
+  }
+)
+```
+
+节点生成和节点更新 Agent 都注册了这个工具。模型可以先提出自然语言查询，工具完成 Embedding 和向量检索，再把最多三条配置路径与说明返回给模型。返回结果不包含距离值，避免把数据库内部排序指标暴露给生成模型。
+
+这形成了一个轻量 RAG 闭环：
+
+```text
+用户编辑要求
+   ▼
+节点 Agent 判断是否需要 ECharts 配置知识
+   ▼
+search_echarts_options
+   ▼
+查询向量 → sqlite-vec → 配置路径与说明
+   ▼
+Agent 生成符合物料 Schema 的节点配置
+```
+
+## 30. `createAgent` 与结构化节点输出
+
+新增和更新节点使用 LangChain 的 `createAgent`，并通过 `toolStrategy(materialSchema.configSchema)` 约束最终结构化响应：
+
+```ts
+const agent = createAgent({
+  model,
+  tools: [searchEChartsOptions],
+  responseFormat: toolStrategy(materialSchema.configSchema),
+  systemPrompt: '...',
+})
+```
+
+这里同时存在两类结构化约束：
+
+- `searchEChartsOptions` 的输入由工具自己的 Zod Schema 校验。
+- 节点最终结果由物料的 `configSchema` 校验。
+
+生成 Agent 使用普通 `createChatModel`，允许模型调用工具并生成结果；更新 Agent 使用 `createNonStreamingModel`，适合内部执行阶段。生成结果的 `structuredResponse` 被转换为节点对象，然后由代码补全或覆盖 `id`、`type`。
+
+当前实现传入的是 `materialSchema.configSchema` 的原始结构。如果该字段仍是 JSON Schema 而不是 LangChain 可直接识别的 Zod Schema，需要在运行前统一转换，否则结构化输出可能无法按预期工作。
+
+## 31. 模型工厂与 Embedding 配置
+
+`src/ai/model.ts` 现在集中提供三类能力：
+
+```ts
+createChatModel() // 普通聊天模型
+createNonStreamingModel() // 禁止流式输出的内部调用
+createEmbeddingModel() // ECharts 文档和查询向量
+```
+
+Embedding 使用独立的环境变量：
+
+| 环境变量                    | 用途               |
+| --------------------------- | ------------------ |
+| `OPENAI_EMBEDDING_MODEL`    | Embedding 模型名称 |
+| `OPENAI_EMBEDDING_BASE_URL` | Embedding 服务地址 |
+| `OPENAI_EMBEDDING_API_KEY`  | Embedding 服务密钥 |
+
+聊天模型仍使用 `OPENAI_CHAT_MODEL` 等配置。将聊天与 Embedding 的地址、模型和密钥分开，便于使用不同服务或不同模型承担生成与检索任务。
+
+`createNonStreamingModel` 在 `createChatModel` 上统一设置 `disableStreaming: true` 和 `tags: ['nostream']`。分类、编辑规划和节点更新都可复用这条配置，避免每个节点重复声明。
+
+## 32. 运行 RAG 构建脚本
+
+应用新增了脚本命令：
+
+```bash
+cd apps/agent-server
+pnpm rag
+```
+
+该命令通过 `.env` 加载环境变量，读取本地 ECharts 资源，调用 Embedding 服务，并生成：
+
+```text
+apps/agent-server/data/rag.sqlite
+```
+
+重新构建知识库前，需要确认目标 SQLite 文件是否需要重建。当前 `writeKnowledgeDatabase` 使用 `CREATE TABLE` 和 `CREATE VIRTUAL TABLE`，若数据库已经存在相同表名，重复运行可能因为表已存在而失败。更稳妥的做法是显式删除旧库、使用临时库替换，或在写入前实现版本化迁移。
+
+脚本还依赖本地 Node.js 对 `.ts` 入口的支持，以及 `better-sqlite3`、`sqlite-vec` 的原生模块。部署或 CI 环境应先确认 Node 版本、操作系统和原生依赖可用。
+
+## 33. 当前验证结果与待修复项
+
+本次检查中，应用构建命令：
+
+```bash
+pnpm --filter agent-server build
+```
+
+未通过，错误来自 `tsconfig.json`：
+
+```text
+TS5096: Option 'allowImportingTsExtensions' can only be used when one of
+'noEmit', 'emitDeclarationOnly', or 'rewriteRelativeImportExtensions' is set.
+```
+
+当前 `build` 同时执行 `tsc` 和 `tsc-alias`，因此应在后续整理或实现时选择一种一致方案：
+
+- 移除 `allowImportingTsExtensions`，把源码导入统一写成构建后的 `.js` 路径。
+- 或配置 `rewriteRelativeImportExtensions`，让 TypeScript 在输出阶段重写扩展名。
+- 或仅在专门的脚本配置中允许 `.ts` 扩展名，把生产构建配置与脚本执行配置分开。
+
+这项错误与 RAG 逻辑无关，但会阻止应用通过正式构建流程。RAG 脚本是否能独立运行，还需要在配置好 Embedding 服务后进行实际调用验证。
+
+## 34. 当前完整执行链路
+
+从一次用户请求开始，当前 Agent 的主要流程是：
+
+1. `classifyTask` 判断请求属于普通问答、创建页面还是编辑页面。
+2. 普通问答进入 `handleMessageTask`，结合页面上下文回答。
+3. 创建页面进入 `handlePageTask`，当前仍是待完善分支。
+4. 编辑页面进入 `handlePlanEdit`，根据物料、节点和选中状态生成 `editPlan`。
+5. 没有足够信息时直接反馈补充问题并结束。
+6. 有计划时进入 `handleEditTask`，依次执行新增、更新或删除。
+7. 新增和更新节点 Agent 可调用 ECharts RAG 工具查询配置说明。
+8. 执行结果写入 `actions`，`handleEditResult` 将真实动作改写成用户可读反馈。
+9. 画布应用层根据 `actions` 更新页面；当前图本身暂未把动作直接合并回 `page`。
+
+这套结构已经形成了从意图识别、任务规划、工具检索、结构化生成到结果反馈的基本 Agent 工作流。

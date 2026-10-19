@@ -15,6 +15,7 @@
     "strictPropertyInitialization": false,
     "allowJs": true,
     "strict": false,
+    "allowImportingTsExtensions": true,
     "strictFunctionTypes": false,
     "outDir": "dist",
     "types": ["jest", "node"],

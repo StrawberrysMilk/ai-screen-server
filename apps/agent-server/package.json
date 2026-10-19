@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "langgraphjs dev --no-browser",
     "build": "tsc && tsc-alias",
+    "rag": "node --env-file=.env src/scripts/build-echarts-rag.ts",
     "clean": "rm -rf dist",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --testPathPatterns=\\.test\\.ts$ --testPathIgnorePatterns=\\.int\\.test\\.ts$",
     "test:int": "node --experimental-vm-modules node_modules/jest/bin/jest.js --testPathPatterns=\\.int\\.test\\.ts$",
@@ -22,6 +23,10 @@
     "@langchain/core": "^1.2.3",
     "@langchain/langgraph": "^1.4.8",
     "@langchain/openai": "1.5.6",
+    "better-sqlite3": "^13.0.3",
+    "entities": "^8.1.0",
+    "langchain": "^1.5.18",
+    "sqlite-vec": "^0.1.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {
