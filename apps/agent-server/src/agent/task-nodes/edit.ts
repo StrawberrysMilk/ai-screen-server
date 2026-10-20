@@ -86,6 +86,7 @@ export async function updateNode(currentNode, materialSchema, prompt) {
 export async function handleEditTask(state) {
   const plans = state.editPlan
   const actions = []
+
   for (const plan of plans) {
     const { type, id, action, prompt } = plan
     const schema = state.schema.material.find(m => m.type === type)
